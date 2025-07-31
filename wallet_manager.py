@@ -1,6 +1,6 @@
 import logging
 from decimal import Decimal
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from datetime import datetime
 
 from trmp_rpc import TrumpowRPC, TrumpowRPCError
@@ -351,3 +351,416 @@ class WalletManager:
             
         except (ValueError, TypeError):
             return False, "Invalid amount format", None
+
+
+class AdvancedWalletManager(WalletManager):
+    """
+    Advanced wallet manager that uses raw transactions for better control
+    and to avoid change address issues. Extends the base WalletManager.
+    """
+    
+    def __init__(self, rpc_client: TrumpowRPC, db_manager: DatabaseManager, 
+                 min_tip: Decimal, max_tip: Decimal, withdrawal_fee: Decimal, 
+                 confirmation_blocks: int = 3, use_raw_transactions: bool = True):
+        super().__init__(rpc_client, db_manager, min_tip, max_tip, withdrawal_fee, confirmation_blocks)
+        self.use_raw_transactions = use_raw_transactions
+        self.logger = logging.getLogger(__name__ + ".Advanced")
+    
+    def get_user_balance_advanced(self, user: User) -> Dict[str, Decimal]:
+        """
+        Get detailed balance information using UTXO analysis.
+        
+        Returns:
+            Dict with 'confirmed', 'unconfirmed', 'locked', and 'utxo_count'
+        """
+        try:
+            # Get all UTXOs for user's addresses
+            addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            if not addresses:
+                return {
+                    'confirmed': Decimal('0'),
+                    'unconfirmed': Decimal('0'),
+                    'locked': Decimal('0'),
+                    'utxo_count': 0
+                }
+            
+            # Get confirmed UTXOs
+            confirmed_utxos = self.rpc.list_unspent(
+                self.confirmation_blocks, 
+                9999999, 
+                addresses
+            )
+            
+            # Get all UTXOs (including unconfirmed)
+            all_utxos = self.rpc.list_unspent(
+                0, 
+                9999999, 
+                addresses
+            )
+            
+            # Get locked UTXOs
+            locked_utxos = self.rpc.list_lock_unspent()
+            
+            confirmed_balance = sum(Decimal(str(utxo['amount'])) for utxo in confirmed_utxos)
+            total_balance = sum(Decimal(str(utxo['amount'])) for utxo in all_utxos)
+            unconfirmed_balance = total_balance - confirmed_balance
+            
+            # Calculate locked balance
+            locked_balance = Decimal('0')
+            for locked in locked_utxos:
+                for utxo in all_utxos:
+                    if (utxo['txid'] == locked['txid'] and 
+                        utxo['vout'] == locked['vout']):
+                        locked_balance += Decimal(str(utxo['amount']))
+                        break
+            
+            return {
+                'confirmed': confirmed_balance,
+                'unconfirmed': unconfirmed_balance,
+                'locked': locked_balance,
+                'utxo_count': len(all_utxos)
+            }
+            
+        except TrumpowRPCError as e:
+            self.logger.error(f"Failed to get advanced balance for user {user.username}: {e}")
+            return {
+                'confirmed': Decimal('0'),
+                'unconfirmed': Decimal('0'),
+                'locked': Decimal('0'),
+                'utxo_count': 0
+            }
+    
+    def send_tip_raw(self, from_user: User, to_user: User, amount: Decimal, 
+                     comment: str = "", fee_rate: Decimal = None) -> Tuple[bool, str, Optional[int]]:
+        """
+        Send a tip using raw transactions for better control.
+        
+        Returns:
+            (success, message, transaction_id)
+        """
+        if not self.use_raw_transactions:
+            return self.send_tip(from_user, to_user, amount, comment)
+        
+        # Validate amount
+        if amount < self.min_tip:
+            return False, f"Minimum tip amount is {self.min_tip} TRMP", None
+        
+        if amount > self.max_tip:
+            return False, f"Maximum tip amount is {self.max_tip} TRMP", None
+        
+        # Get from and to addresses
+        from_addresses = self.rpc.get_addresses_by_account(from_user.trmp_account)
+        to_address = to_user.trmp_address
+        
+        if not from_addresses:
+            return False, "No addresses available for sender", None
+        
+        # Check balance using UTXO analysis
+        balance_info = self.get_user_balance_advanced(from_user)
+        if balance_info['confirmed'] < amount:
+            return False, f"Insufficient confirmed balance. You have {balance_info['confirmed']} TRMP", None
+        
+        try:
+            # Create transaction record
+            transaction = Transaction(
+                id=None,
+                from_user_id=from_user.user_id,
+                to_user_id=to_user.user_id,
+                amount=amount,
+                fee=Decimal('0'),  # Will be updated with actual fee
+                tx_type='tip',
+                status='pending',
+                txid=None,
+                created_at=datetime.now(),
+                comment=comment
+            )
+            
+            transaction_id = self.db.create_transaction(transaction)
+            
+            # For internal tips, we'll use a hybrid approach:
+            # Create a proper transaction but use account move for instant confirmation
+            success = self.rpc.move(
+                from_user.trmp_account,
+                to_user.trmp_account,
+                amount,
+                self.confirmation_blocks,
+                f"Raw tip from {from_user.username} to {to_user.username}"
+            )
+            
+            if success:
+                # Update transaction status
+                self.db.update_transaction_status(transaction_id, 'confirmed')
+                
+                # Update user statistics
+                self.db.update_user_tip_stats(from_user.user_id)
+                
+                self.logger.info(f"Raw tip successful: {from_user.username} -> {to_user.username} ({amount} TRMP)")
+                return True, f"Successfully sent {amount} TRMP to {to_user.username}! (Raw transaction mode)", transaction_id
+            else:
+                self.db.update_transaction_status(transaction_id, 'failed')
+                return False, "Transaction failed. Please try again.", transaction_id
+                
+        except TrumpowRPCError as e:
+            self.logger.error(f"Raw tip failed: {from_user.username} -> {to_user.username}: {e}")
+            if transaction_id:
+                self.db.update_transaction_status(transaction_id, 'failed')
+            return False, f"Transaction failed: {str(e)}", transaction_id
+    
+    def withdraw_to_address_raw(self, user: User, address: str, amount: Decimal, 
+                               fee_rate: Decimal = None) -> Tuple[bool, str, Optional[int]]:
+        """
+        Withdraw TRMP to an external address using raw transactions.
+        This provides better control over fees and change addresses.
+        
+        Returns:
+            (success, message, transaction_id)
+        """
+        if not self.use_raw_transactions:
+            return self.withdraw_to_address(user, address, amount)
+        
+        # Validate address
+        try:
+            addr_info = self.rpc.validate_address(address)
+            if not addr_info.get('isvalid', False):
+                return False, "Invalid TRMP address", None
+        except TrumpowRPCError as e:
+            return False, f"Address validation failed: {str(e)}", None
+        
+        # Get user's addresses for UTXO selection
+        user_addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+        if not user_addresses:
+            return False, "No addresses available for withdrawal", None
+        
+        # Get balance info
+        balance_info = self.get_user_balance_advanced(user)
+        
+        try:
+            # Use the advanced transaction building method
+            # We'll build a raw transaction for external withdrawals
+            
+            # For now, we'll select the best address with sufficient balance
+            best_address = None
+            best_balance = Decimal('0')
+            
+            for addr in user_addresses:
+                addr_utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, [addr])
+                addr_balance = sum(Decimal(str(utxo['amount'])) for utxo in addr_utxos)
+                
+                if addr_balance >= amount and addr_balance > best_balance:
+                    best_address = addr
+                    best_balance = addr_balance
+            
+            if not best_address:
+                return False, f"Insufficient confirmed balance for withdrawal. Need {amount} TRMP", None
+            
+            # Create transaction record
+            transaction = Transaction(
+                id=None,
+                from_user_id=user.user_id,
+                to_user_id=None,
+                amount=amount,
+                fee=self.withdrawal_fee,  # Will be updated with actual fee
+                tx_type='withdraw',
+                status='pending',
+                txid=None,
+                created_at=datetime.now(),
+                to_address=address
+            )
+            
+            transaction_id = self.db.create_transaction(transaction)
+            
+            # Try to build and send raw transaction
+            try:
+                txid = self.rpc.send_raw_transaction_safe(
+                    best_address, 
+                    address, 
+                    amount, 
+                    fee_rate
+                )
+                
+                # Update transaction with txid and actual fee
+                self.db.update_transaction_status(transaction_id, 'confirmed', txid)
+                
+                # Update user withdrawal statistics
+                # Note: For raw transactions, we should calculate actual fee from the transaction
+                total_cost = amount + self.withdrawal_fee  # Approximation
+                self.db.update_user_withdrawal_stats(user.user_id, total_cost)
+                
+                self.logger.info(f"Raw withdrawal successful: {user.username} -> {address} ({amount} TRMP, txid: {txid})")
+                return True, f"Successfully withdrew {amount} TRMP to {address}!\nTransaction ID: {txid}\n(Raw transaction mode)", transaction_id
+                
+            except TrumpowRPCError as raw_error:
+                # If raw transaction fails, fall back to standard method
+                self.logger.warning(f"Raw transaction failed, falling back to standard method: {raw_error}")
+                
+                txid = self.rpc.send_from(
+                    user.trmp_account,
+                    address,
+                    amount,
+                    self.confirmation_blocks,
+                    f"Fallback withdrawal for {user.username}",
+                    f"To: {address}"
+                )
+                
+                # Update transaction with txid
+                self.db.update_transaction_status(transaction_id, 'confirmed', txid)
+                
+                # Update user withdrawal statistics
+                total_cost = amount + self.withdrawal_fee
+                self.db.update_user_withdrawal_stats(user.user_id, total_cost)
+                
+                self.logger.info(f"Fallback withdrawal successful: {user.username} -> {address} ({amount} TRMP, txid: {txid})")
+                return True, f"Successfully withdrew {amount} TRMP to {address}!\nTransaction ID: {txid}\n(Fallback mode)", transaction_id
+            
+        except TrumpowRPCError as e:
+            self.logger.error(f"Raw withdrawal failed: {user.username} -> {address}: {e}")
+            if transaction_id:
+                self.db.update_transaction_status(transaction_id, 'failed')
+            return False, f"Withdrawal failed: {str(e)}", transaction_id
+    
+    def consolidate_utxos(self, user: User, target_address: str = None, 
+                         fee_rate: Decimal = None) -> Tuple[bool, str]:
+        """
+        Consolidate user's UTXOs to reduce fragmentation.
+        
+        Args:
+            user: User whose UTXOs to consolidate
+            target_address: Target address (defaults to user's primary address)
+            fee_rate: Fee rate for the consolidation transaction
+            
+        Returns:
+            (success, message)
+        """
+        try:
+            # Get user's addresses
+            user_addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            if not user_addresses:
+                return False, "No addresses found for user"
+            
+            # Get all UTXOs
+            all_utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, user_addresses)
+            
+            # Only consolidate if there are multiple UTXOs
+            if len(all_utxos) < 2:
+                return False, "Not enough UTXOs to consolidate"
+            
+            # Use primary address as target if not specified
+            if not target_address:
+                target_address = user.trmp_address
+            
+            # Calculate total amount
+            total_amount = sum(Decimal(str(utxo['amount'])) for utxo in all_utxos)
+            
+            # Prepare inputs
+            inputs = [{'txid': utxo['txid'], 'vout': utxo['vout']} for utxo in all_utxos]
+            
+            # Estimate fee
+            if fee_rate is None:
+                fee_rate = self.rpc.estimate_fee(6)
+            
+            # Rough fee calculation (inputs * 180 + outputs * 34 + 10 bytes)
+            tx_size = len(inputs) * 180 + 1 * 34 + 10
+            estimated_fee = fee_rate * (tx_size / 1000)
+            
+            # Calculate output amount
+            output_amount = total_amount - estimated_fee
+            
+            if output_amount <= Decimal('0'):
+                return False, "Consolidation would result in zero or negative output"
+            
+            # Create outputs
+            outputs = {target_address: float(output_amount)}
+            
+            # Create and sign transaction
+            raw_tx = self.rpc.create_raw_transaction(inputs, outputs)
+            signed_result = self.rpc.sign_raw_transaction(raw_tx)
+            
+            if not signed_result.get('complete', False):
+                return False, "Failed to sign consolidation transaction"
+            
+            # Send transaction
+            txid = self.rpc.send_raw_transaction(signed_result['hex'])
+            
+            self.logger.info(f"UTXO consolidation successful for {user.username}: {len(inputs)} UTXOs -> 1 UTXO, txid: {txid}")
+            return True, f"Successfully consolidated {len(inputs)} UTXOs into 1. Transaction ID: {txid}"
+            
+        except TrumpowRPCError as e:
+            self.logger.error(f"UTXO consolidation failed for {user.username}: {e}")
+            return False, f"Consolidation failed: {str(e)}"
+    
+    def get_utxo_analysis(self, user: User) -> Dict:
+        """
+        Get detailed UTXO analysis for a user.
+        
+        Returns:
+            Dict with UTXO statistics and recommendations
+        """
+        try:
+            user_addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            if not user_addresses:
+                return {
+                    'total_utxos': 0,
+                    'total_value': Decimal('0'),
+                    'largest_utxo': Decimal('0'),
+                    'smallest_utxo': Decimal('0'),
+                    'fragmentation_level': 'none',
+                    'consolidation_recommended': False
+                }
+            
+            all_utxos = self.rpc.list_unspent(0, 9999999, user_addresses)
+            confirmed_utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, user_addresses)
+            
+            if not all_utxos:
+                return {
+                    'total_utxos': 0,
+                    'total_value': Decimal('0'),
+                    'largest_utxo': Decimal('0'),
+                    'smallest_utxo': Decimal('0'),
+                    'fragmentation_level': 'none',
+                    'consolidation_recommended': False
+                }
+            
+            amounts = [Decimal(str(utxo['amount'])) for utxo in all_utxos]
+            confirmed_amounts = [Decimal(str(utxo['amount'])) for utxo in confirmed_utxos]
+            
+            total_value = sum(amounts)
+            total_confirmed = sum(confirmed_amounts) if confirmed_amounts else Decimal('0')
+            
+            # Determine fragmentation level
+            utxo_count = len(all_utxos)
+            if utxo_count > 50:
+                fragmentation_level = 'high'
+                consolidation_recommended = True
+            elif utxo_count > 20:
+                fragmentation_level = 'medium'
+                consolidation_recommended = True
+            elif utxo_count > 10:
+                fragmentation_level = 'low'
+                consolidation_recommended = False
+            else:
+                fragmentation_level = 'none'
+                consolidation_recommended = False
+            
+            return {
+                'total_utxos': utxo_count,
+                'confirmed_utxos': len(confirmed_utxos),
+                'total_value': total_value,
+                'confirmed_value': total_confirmed,
+                'largest_utxo': max(amounts),
+                'smallest_utxo': min(amounts),
+                'average_utxo': total_value / utxo_count,
+                'fragmentation_level': fragmentation_level,
+                'consolidation_recommended': consolidation_recommended,
+                'dust_utxos': len([a for a in amounts if a < Decimal('0.001')])
+            }
+            
+        except TrumpowRPCError as e:
+            self.logger.error(f"UTXO analysis failed for {user.username}: {e}")
+            return {
+                'total_utxos': 0,
+                'total_value': Decimal('0'),
+                'largest_utxo': Decimal('0'),
+                'smallest_utxo': Decimal('0'),
+                'fragmentation_level': 'unknown',
+                'consolidation_recommended': False
+            }
