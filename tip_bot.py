@@ -95,29 +95,35 @@ class TrumpowTipBot:
 • `/start` - Create your wallet and get started
 • `/balance` - Check your TRMP balance
 • `/deposit` - Get your deposit address
-• `/withdraw <amount> <address>` - Withdraw TRMP (private chat only)
+• `/withdraw <amount> <address>` - Withdraw TRMP (no change addresses)
 • `/history` - View recent transactions
+• `/utxos` - Analyze your UTXOs for privacy
 
 🎯 **Tipping Commands:**
-• `/tip <amount> @username` - Send TRMP to another user
+• `/tip <amount> @username` - Send TRMP (internal account transfer)
 • `/tip <amount> <reply>` - Tip user by replying to their message
+• `/rawtip <amount> @username` - Raw tip (on-chain, no change address)
 
 📊 **Info Commands:**
 • `/help` - Show this help message
 • `/stats` - Show bot statistics (admins only)
 
-🔧 **Examples:**
-• `/tip 100 @alice` - Send 100 TRMP to alice
-• `/withdraw 50 TRMPAddressHere` - Withdraw 50 TRMP
-• `/balance` - Check your balance
+🔧 **Admin Commands:**
+• `/consolidate` - Merge small UTXOs (admins only)
+
+💡 **Examples:**
+• `/tip 100 @alice` - Send 100 TRMP to alice (internal)
+• `/rawtip 100 @alice` - Raw tip 100 TRMP (blockchain tx)
+• `/withdraw 50 TRMPAddressHere` - Withdraw 50 TRMP (no change)
+• `/utxos` - See which amounts you can send without change
 
 ⚙️ **Settings:**
 • Minimum tip: {self.config.MINIMUM_TIP} TRMP
 • Maximum tip: {self.config.MAXIMUM_TIP} TRMP
-• Withdrawal fee: {self.config.WITHDRAWAL_FEE} TRMP
+• Max withdrawal fee: {self.config.WITHDRAWAL_FEE} TRMP
 • Confirmations required: {self.config.CONFIRMATION_BLOCKS}
 
-🔒 **Security:** Use private messages for withdrawals and deposits!"""
+🔒 **Privacy:** Raw transactions and withdrawals avoid change addresses for maximum privacy!"""
         
         await update.message.reply_text(help_text, parse_mode='Markdown')
     
@@ -421,6 +427,155 @@ Use /balance to check your updated balance!"""
             self.logger.error(f"Error in stats command: {e}")
             await update.message.reply_text("❌ Error getting statistics. Please try again later.")
     
+    async def utxos_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /utxos command - show UTXO analysis."""
+        user = update.effective_user
+        
+        try:
+            bot_user = self.wallet_manager.create_or_get_user(user.id, user.username or str(user.id))
+            utxo_summary = self.wallet_manager.get_utxo_summary(bot_user)
+            
+            if not utxo_summary or utxo_summary.get('total_utxos', 0) == 0:
+                await update.message.reply_text("📊 You have no UTXOs (unspent transaction outputs).")
+                return
+            
+            no_change_list = ""
+            if utxo_summary.get('no_change_possible'):
+                no_change_list = "\n\n🎯 **Amounts you can send without change:**\n"
+                for min_amt, max_amt in utxo_summary['no_change_possible'][:5]:
+                    no_change_list += f"• {min_amt:.8f} - {max_amt:.8f} TRMP\n"
+            
+            utxo_msg = f"""📊 **UTXO Analysis**
+
+💰 **Summary:**
+• Total UTXOs: {utxo_summary['total_utxos']}
+• Total Amount: {utxo_summary['total_amount']:.8f} TRMP
+• Largest UTXO: {utxo_summary['largest_utxo']:.8f} TRMP
+• Smallest UTXO: {utxo_summary['smallest_utxo']:.8f} TRMP
+• Average UTXO: {utxo_summary['average_utxo']:.8f} TRMP{no_change_list}
+
+💡 **Tip:** Transactions without change addresses are more private and efficient!"""
+            
+            await update.message.reply_text(utxo_msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            self.logger.error(f"Error in utxos command: {e}")
+            await update.message.reply_text("❌ Error getting UTXO information. Please try again later.")
+    
+    async def consolidate_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /consolidate command - consolidate small UTXOs."""
+        user = update.effective_user
+        
+        try:
+            bot_user = self.wallet_manager.create_or_get_user(user.id, user.username or str(user.id))
+            
+            # Check if user has admin privileges (you may want to add proper admin checking)
+            if user.id not in getattr(self.config, 'ADMIN_USER_IDS', []):
+                await update.message.reply_text("❌ This command is only available to administrators.")
+                return
+            
+            success, result = self.wallet_manager.consolidate_utxos(bot_user)
+            
+            if success:
+                await update.message.reply_text(f"✅ UTXO consolidation successful!\n\n{result}")
+            else:
+                await update.message.reply_text(f"❌ UTXO consolidation failed: {result}")
+                
+        except Exception as e:
+            self.logger.error(f"Error in consolidate command: {e}")
+            await update.message.reply_text("❌ Error consolidating UTXOs. Please try again later.")
+    
+    async def rawtip_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /rawtip command - tip using raw transactions (no change)."""
+        user = update.effective_user
+        
+        # Check rate limits
+        try:
+            bot_user = self.wallet_manager.create_or_get_user(user.id, user.username or str(user.id))
+            tips_today, _, _ = self.db.check_rate_limits(user.id)
+            
+            if tips_today >= self.config.RATE_LIMIT_TIPS_PER_HOUR:
+                await update.message.reply_text(f"🚫 Rate limit exceeded. You can send {self.config.RATE_LIMIT_TIPS_PER_HOUR} tips per hour.")
+                return
+                
+        except Exception as e:
+            self.logger.error(f"Error checking rate limits: {e}")
+            await update.message.reply_text("❌ Error processing tip. Please try again later.")
+            return
+        
+        # Parse command arguments (same as regular tip)
+        if len(context.args) < 2:
+            await update.message.reply_text("""❌ **Invalid rawtip format!**
+
+📝 **Correct usage:**
+• `/rawtip <amount> @username` - Raw tip (no change address)
+• Reply to a message and use `/rawtip <amount>` - Raw tip by reply
+
+🔧 **Examples:**
+• `/rawtip 100 @alice` (creates on-chain transaction)
+• `/rawtip 50` (as a reply to someone's message)
+
+⚠️ **Note:** Raw tips create actual blockchain transactions and may fail if your UTXOs don't match the amount closely enough.""", parse_mode='Markdown')
+            return
+        
+        # Parse amount
+        amount_str = context.args[0]
+        valid, error_msg, amount = self.wallet_manager.validate_amount(amount_str)
+        if not valid:
+            await update.message.reply_text(f"❌ {error_msg}")
+            return
+        
+        # Find target user (same logic as regular tip)
+        target_user = None
+        
+        if update.message.reply_to_message:
+            target_user_tg = update.message.reply_to_message.from_user
+            if target_user_tg.id == user.id:
+                await update.message.reply_text("❌ You cannot tip yourself!")
+                return
+            target_user = self.wallet_manager.create_or_get_user(
+                target_user_tg.id, target_user_tg.username or str(target_user_tg.id)
+            )
+        else:
+            target_username = context.args[1].replace('@', '').lower()
+            target_user = self.db.get_user_by_username(target_username)
+            
+            if not target_user:
+                await update.message.reply_text(f"❌ User @{target_username} not found. They need to start the bot first!")
+                return
+        
+        # Perform the raw tip
+        try:
+            success, message, transaction_id = self.wallet_manager.send_tip(
+                bot_user, target_user, amount, 
+                f"Raw tip via Telegram from {user.username or user.id}",
+                use_raw_transactions=True  # Force raw transactions
+            )
+            
+            if success:
+                # Update rate limits
+                self.db.increment_rate_limit(user.id, 'tip')
+                
+                # Send confirmation to both users
+                await update.message.reply_text(f"✅ {message}")
+                
+                # Notify the recipient
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_user.user_id,
+                        text=f"🎉 You received a raw tip of {amount} TRMP from {user.username or 'someone'}!\n\n"
+                             f"This was sent as an on-chain transaction (no change address used). "
+                             f"Use /balance to see your updated balance."
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to notify tip recipient: {e}")
+            else:
+                await update.message.reply_text(f"❌ {message}")
+                
+        except Exception as e:
+            self.logger.error(f"Error in rawtip command: {e}")
+            await update.message.reply_text("❌ Error processing tip. Please try again later.")
+    
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors."""
         self.logger.error(f"Update {update} caused error {context.error}")
@@ -441,8 +596,11 @@ Use /balance to check your updated balance!"""
         application.add_handler(CommandHandler("balance", self.balance_command))
         application.add_handler(CommandHandler("deposit", self.deposit_command))
         application.add_handler(CommandHandler("tip", self.tip_command))
+        application.add_handler(CommandHandler("rawtip", self.rawtip_command))
         application.add_handler(CommandHandler("withdraw", self.withdraw_command))
         application.add_handler(CommandHandler("history", self.history_command))
+        application.add_handler(CommandHandler("utxos", self.utxos_command))
+        application.add_handler(CommandHandler("consolidate", self.consolidate_command))
         application.add_handler(CommandHandler("stats", self.stats_command))
         
         # Add error handler

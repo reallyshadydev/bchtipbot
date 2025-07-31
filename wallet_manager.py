@@ -66,9 +66,16 @@ class WalletManager:
             return Decimal('0')
     
     def send_tip(self, from_user: User, to_user: User, amount: Decimal, 
-                 comment: str = "") -> Tuple[bool, str, Optional[int]]:
+                 comment: str = "", use_raw_transactions: bool = False) -> Tuple[bool, str, Optional[int]]:
         """
         Send a tip from one user to another.
+        
+        Args:
+            from_user: Sender user
+            to_user: Recipient user
+            amount: Amount to tip
+            comment: Optional comment
+            use_raw_transactions: Whether to use raw transactions (avoids change) vs account moves
         
         Returns:
             (success, message, transaction_id)
@@ -102,37 +109,65 @@ class WalletManager:
             
             transaction_id = self.db.create_transaction(transaction)
             
-            # Perform the move operation in Trumpow
-            success = self.rpc.move(
-                from_user.trmp_account,
-                to_user.trmp_account,
-                amount,
-                self.confirmation_blocks,
-                f"Tip from {from_user.username} to {to_user.username}"
-            )
+            if use_raw_transactions:
+                # Use raw transaction approach for tips (creates on-chain transaction)
+                try:
+                    from_addresses = self.rpc.get_addresses_by_account(from_user.trmp_account)
+                    to_address = to_user.trmp_address
+                    
+                    max_fee = Decimal('0.01')  # Max fee for tips
+                    success, result, raw_tx = self.build_raw_transaction_no_change(
+                        from_addresses, to_address, amount, max_fee
+                    )
+                    
+                    if success:
+                        txid = result
+                        self.db.update_transaction_status(transaction_id, 'confirmed', txid)
+                        self.db.update_user_tip_stats(from_user.user_id)
+                        
+                        self.logger.info(f"Raw tip successful: {from_user.username} -> {to_user.username} ({amount} TRMP, txid: {txid})")
+                        return True, f"Successfully sent {amount} TRMP to {to_user.username}! (On-chain transaction)", transaction_id
+                    else:
+                        # Fall back to account move if raw transaction fails
+                        self.logger.warning(f"Raw tip failed, falling back to account move: {result}")
+                        use_raw_transactions = False
+                        
+                except Exception as e:
+                    self.logger.warning(f"Raw tip failed, falling back to account move: {e}")
+                    use_raw_transactions = False
             
-            if success:
-                # Update transaction status
-                self.db.update_transaction_status(transaction_id, 'confirmed')
+            if not use_raw_transactions:
+                # Use account move operation (off-chain, internal to wallet)
+                success = self.rpc.move(
+                    from_user.trmp_account,
+                    to_user.trmp_account,
+                    amount,
+                    self.confirmation_blocks,
+                    f"Tip from {from_user.username} to {to_user.username}"
+                )
                 
-                # Update user statistics
-                self.db.update_user_tip_stats(from_user.user_id)
-                
-                self.logger.info(f"Tip successful: {from_user.username} -> {to_user.username} ({amount} TRMP)")
-                return True, f"Successfully sent {amount} TRMP to {to_user.username}!", transaction_id
-            else:
-                self.db.update_transaction_status(transaction_id, 'failed')
-                return False, "Transaction failed. Please try again.", transaction_id
+                if success:
+                    # Update transaction status
+                    self.db.update_transaction_status(transaction_id, 'confirmed')
+                    
+                    # Update user statistics
+                    self.db.update_user_tip_stats(from_user.user_id)
+                    
+                    self.logger.info(f"Tip successful: {from_user.username} -> {to_user.username} ({amount} TRMP)")
+                    return True, f"Successfully sent {amount} TRMP to {to_user.username}!", transaction_id
+                else:
+                    self.db.update_transaction_status(transaction_id, 'failed')
+                    return False, "Transaction failed. Please try again.", transaction_id
                 
         except TrumpowRPCError as e:
             self.logger.error(f"Tip failed: {from_user.username} -> {to_user.username}: {e}")
-            if transaction_id:
+            if 'transaction_id' in locals():
                 self.db.update_transaction_status(transaction_id, 'failed')
-            return False, f"Transaction failed: {str(e)}", transaction_id
+            return False, f"Transaction failed: {str(e)}", transaction_id if 'transaction_id' in locals() else None
     
     def withdraw_to_address(self, user: User, address: str, amount: Decimal) -> Tuple[bool, str, Optional[int]]:
         """
-        Withdraw TRMP to an external address.
+        Withdraw TRMP to an external address using raw transactions to avoid change addresses.
         
         Returns:
             (success, message, transaction_id)
@@ -145,13 +180,18 @@ class WalletManager:
         except TrumpowRPCError as e:
             return False, f"Address validation failed: {str(e)}", None
         
-        # Calculate total amount needed (including fee)
-        total_needed = amount + self.withdrawal_fee
-        
-        # Check user's balance
+        # Check user's balance first
         user_balance = self.get_user_balance(user)
-        if user_balance < total_needed:
-            return False, f"Insufficient balance. You need {total_needed} TRMP (including {self.withdrawal_fee} TRMP fee)", None
+        if user_balance < amount:
+            return False, f"Insufficient balance. You have {user_balance} TRMP", None
+        
+        # Get user's addresses to spend from
+        try:
+            user_addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            if not user_addresses:
+                return False, "No addresses found for user account", None
+        except TrumpowRPCError as e:
+            return False, f"Failed to get user addresses: {str(e)}", None
         
         try:
             # Create transaction record
@@ -160,7 +200,7 @@ class WalletManager:
                 from_user_id=user.user_id,
                 to_user_id=None,
                 amount=amount,
-                fee=self.withdrawal_fee,
+                fee=Decimal('0'),  # Fee will be calculated by raw transaction builder
                 tx_type='withdraw',
                 status='pending',
                 txid=None,
@@ -170,30 +210,44 @@ class WalletManager:
             
             transaction_id = self.db.create_transaction(transaction)
             
-            # Send the withdrawal
-            txid = self.rpc.send_from(
-                user.trmp_account,
-                address,
-                amount,
-                self.confirmation_blocks,
-                f"Withdrawal for {user.username}",
-                f"To: {address}"
+            # Build raw transaction without change address
+            max_fee = min(self.withdrawal_fee, amount * Decimal('0.1'))  # Cap fee at 10% of amount
+            success, result, raw_tx = self.build_raw_transaction_no_change(
+                user_addresses, address, amount, max_fee
             )
             
-            # Update transaction with txid
-            self.db.update_transaction_status(transaction_id, 'confirmed', txid)
-            
-            # Update user withdrawal statistics
-            self.db.update_user_withdrawal_stats(user.user_id, total_needed)
-            
-            self.logger.info(f"Withdrawal successful: {user.username} -> {address} ({amount} TRMP, txid: {txid})")
-            return True, f"Successfully withdrew {amount} TRMP to {address}!\nTransaction ID: {txid}", transaction_id
-            
-        except TrumpowRPCError as e:
-            self.logger.error(f"Withdrawal failed: {user.username} -> {address}: {e}")
-            if transaction_id:
+            if not success:
                 self.db.update_transaction_status(transaction_id, 'failed')
-            return False, f"Withdrawal failed: {str(e)}", transaction_id
+                return False, f"Failed to create transaction: {result}", transaction_id
+            
+            # result contains the txid if successful
+            txid = result
+            
+            # Calculate actual fee used
+            try:
+                # Get transaction details to find actual fee
+                tx_info = self.rpc.get_transaction(txid)
+                actual_fee = abs(Decimal(str(tx_info.get('fee', 0))))
+            except:
+                actual_fee = max_fee  # Fallback to estimated fee
+            
+            # Update transaction with txid and actual fee
+            self.db.update_transaction_status(transaction_id, 'confirmed', txid)
+            # Update the fee in the transaction record
+            # Note: You may need to add a method to update transaction fee in database.py
+            
+            # Update user withdrawal statistics  
+            total_cost = amount + actual_fee
+            self.db.update_user_withdrawal_stats(user.user_id, total_cost)
+            
+            self.logger.info(f"Withdrawal successful (no-change): {user.username} -> {address} ({amount} TRMP, fee: {actual_fee}, txid: {txid})")
+            return True, f"Successfully withdrew {amount} TRMP to {address}!\nTransaction ID: {txid}\nNetwork fee: {actual_fee} TRMP", transaction_id
+            
+        except Exception as e:
+            self.logger.error(f"Withdrawal failed: {user.username} -> {address}: {e}")
+            if 'transaction_id' in locals():
+                self.db.update_transaction_status(transaction_id, 'failed')
+            return False, f"Withdrawal failed: {str(e)}", transaction_id if 'transaction_id' in locals() else None
     
     def get_deposit_address(self, user: User) -> str:
         """Get user's deposit address."""
@@ -351,3 +405,327 @@ class WalletManager:
             
         except (ValueError, TypeError):
             return False, "Invalid amount format", None
+    
+    def build_raw_transaction_no_change(self, from_addresses: list, to_address: str, 
+                                       amount: Decimal, max_fee: Decimal = Decimal('0.01')) -> Tuple[bool, str, Optional[str]]:
+        """
+        Build a raw transaction without change addresses by selecting UTXOs that minimize leftover.
+        
+        Args:
+            from_addresses: List of addresses to spend from
+            to_address: Destination address
+            amount: Amount to send
+            max_fee: Maximum acceptable fee
+            
+        Returns:
+            (success, message_or_txid, raw_transaction_hex)
+        """
+        try:
+            # Get all unspent outputs for the addresses
+            all_utxos = []
+            for addr in from_addresses:
+                utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, [addr])
+                for utxo in utxos:
+                    utxo['address'] = addr
+                    all_utxos.append(utxo)
+            
+            if not all_utxos:
+                return False, "No unspent outputs available", None
+            
+            # Sort UTXOs by amount (ascending) to prefer smaller UTXOs first
+            all_utxos.sort(key=lambda x: Decimal(str(x['amount'])))
+            
+            # Find the best combination of UTXOs that minimizes leftover (avoids change)
+            best_combination = self._find_best_utxo_combination(all_utxos, amount, max_fee)
+            
+            if not best_combination:
+                return False, f"Cannot create transaction without change. Available UTXOs don't match required amount closely enough.", None
+            
+            # Build the transaction inputs
+            inputs = []
+            for utxo in best_combination['utxos']:
+                inputs.append({
+                    "txid": utxo['txid'],
+                    "vout": utxo['vout']
+                })
+            
+            # Build the transaction outputs - only destination, no change
+            total_input = best_combination['total_input']
+            actual_fee = total_input - amount
+            
+            if actual_fee > max_fee:
+                return False, f"Required fee ({actual_fee}) exceeds maximum ({max_fee})", None
+            
+            outputs = {to_address: float(amount)}
+            
+            # Create raw transaction
+            raw_tx = self.rpc.create_raw_transaction(inputs, outputs)
+            
+            # Sign the transaction
+            signed_result = self.rpc.sign_raw_transaction(raw_tx)
+            
+            if not signed_result.get('complete', False):
+                return False, "Failed to sign transaction completely", None
+            
+            # Send the transaction
+            txid = self.rpc.send_raw_transaction(signed_result['hex'])
+            
+            self.logger.info(f"Created no-change transaction: {txid}, fee: {actual_fee}")
+            return True, txid, signed_result['hex']
+            
+        except Exception as e:
+            self.logger.error(f"Failed to build raw transaction: {e}")
+            return False, str(e), None
+    
+    def _find_best_utxo_combination(self, utxos: list, target_amount: Decimal, 
+                                   max_fee: Decimal) -> Optional[Dict]:
+        """
+        Find the best combination of UTXOs that gets as close as possible to target_amount + reasonable_fee
+        without going under, to avoid creating change outputs.
+        
+        This uses a greedy approach optimized for minimizing leftover amount.
+        """
+        target_amount = Decimal(str(target_amount))
+        max_fee = Decimal(str(max_fee))
+        min_fee = Decimal('0.0001')  # Minimum network fee
+        
+        # Try different strategies to find UTXOs without change
+        
+        # Strategy 1: Find a single UTXO that matches closely
+        for utxo in utxos:
+            utxo_amount = Decimal(str(utxo['amount']))
+            leftover = utxo_amount - target_amount
+            
+            # Perfect match or small leftover that can be used as fee
+            if min_fee <= leftover <= max_fee:
+                return {
+                    'utxos': [utxo],
+                    'total_input': utxo_amount,
+                    'leftover': leftover
+                }
+        
+        # Strategy 2: Find minimal combination that works
+        # Sort by amount descending for this strategy
+        utxos_desc = sorted(utxos, key=lambda x: Decimal(str(x['amount'])), reverse=True)
+        
+        for i in range(len(utxos_desc)):
+            for j in range(i + 1, min(i + 5, len(utxos_desc))):  # Limit combinations to avoid long computation
+                combo_utxos = utxos_desc[i:j+1]
+                total = sum(Decimal(str(u['amount'])) for u in combo_utxos)
+                leftover = total - target_amount
+                
+                if min_fee <= leftover <= max_fee:
+                    return {
+                        'utxos': combo_utxos,
+                        'total_input': total,
+                        'leftover': leftover
+                    }
+        
+        # Strategy 3: Exact amount combinations (rare but perfect)
+        # Try combinations that sum to exactly target_amount + small_fee
+        for fee in [Decimal('0.0001'), Decimal('0.001'), Decimal('0.01')]:
+            if fee > max_fee:
+                continue
+                
+            exact_target = target_amount + fee
+            
+            # Use subset sum approach for small sets
+            if len(utxos) <= 20:
+                combination = self._find_exact_sum_combination(utxos, exact_target)
+                if combination:
+                    return {
+                        'utxos': combination,
+                        'total_input': exact_target,
+                        'leftover': fee
+                    }
+        
+        return None
+    
+    def _find_exact_sum_combination(self, utxos: list, target: Decimal) -> Optional[list]:
+        """Find a combination of UTXOs that sum to exactly the target amount."""
+        target = Decimal(str(target))
+        
+        # Dynamic programming approach for subset sum
+        n = len(utxos)
+        if n > 15:  # Limit to avoid exponential explosion
+            return None
+        
+        # Convert to integers for DP (multiply by 100000000 to handle 8 decimal places)
+        multiplier = 100000000
+        target_int = int(target * multiplier)
+        amounts = [int(Decimal(str(utxo['amount'])) * multiplier) for utxo in utxos]
+        
+        # Check all combinations (2^n)
+        for mask in range(1, 1 << n):
+            total = 0
+            combination = []
+            
+            for i in range(n):
+                if mask & (1 << i):
+                    total += amounts[i]
+                    combination.append(utxos[i])
+            
+            if total == target_int:
+                return combination
+        
+        return None
+    
+    def get_utxo_summary(self, user: User) -> Dict:
+        """Get a summary of user's UTXOs for analysis."""
+        try:
+            addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            all_utxos = []
+            
+            for addr in addresses:
+                utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, [addr])
+                for utxo in utxos:
+                    utxo['address'] = addr
+                    all_utxos.append(utxo)
+            
+            if not all_utxos:
+                return {
+                    'total_utxos': 0,
+                    'total_amount': Decimal('0'),
+                    'largest_utxo': Decimal('0'),
+                    'smallest_utxo': Decimal('0'),
+                    'average_utxo': Decimal('0'),
+                    'no_change_possible': []
+                }
+            
+            amounts = [Decimal(str(utxo['amount'])) for utxo in all_utxos]
+            total_amount = sum(amounts)
+            
+            # Find amounts that could be sent without change (within reasonable fee range)
+            no_change_amounts = []
+            max_fee = Decimal('0.01')
+            min_fee = Decimal('0.0001')
+            
+            for utxo_amount in amounts:
+                # Single UTXO transactions
+                if min_fee <= utxo_amount <= total_amount:
+                    max_sendable = utxo_amount - min_fee
+                    min_sendable = utxo_amount - max_fee
+                    if min_sendable > 0:
+                        no_change_amounts.append((min_sendable, max_sendable))
+            
+            return {
+                'total_utxos': len(all_utxos),
+                'total_amount': total_amount,
+                'largest_utxo': max(amounts),
+                'smallest_utxo': min(amounts),
+                'average_utxo': total_amount / len(amounts),
+                'no_change_possible': no_change_amounts[:10]  # Top 10 possibilities
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get UTXO summary for {user.username}: {e}")
+            return {}
+    
+    def estimate_transaction_fee(self, from_addresses: list, amount: Decimal) -> Tuple[Decimal, bool]:
+        """
+        Estimate the fee required for a transaction and whether it can be done without change.
+        
+        Returns:
+            (estimated_fee, can_avoid_change)
+        """
+        try:
+            # Get UTXOs for fee estimation
+            all_utxos = []
+            for addr in from_addresses:
+                utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, [addr])
+                all_utxos.extend(utxos)
+            
+            if not all_utxos:
+                return Decimal('0.01'), False  # Default fee, cannot avoid change
+            
+            # Check if we can find UTXOs that avoid change
+            max_fee = Decimal('0.01')
+            combination = self._find_best_utxo_combination(all_utxos, amount, max_fee)
+            
+            if combination:
+                return combination['leftover'], True
+            else:
+                # Estimate fee for traditional transaction with change
+                try:
+                    network_fee = self.rpc.estimate_fee(6)  # 6 block confirmation target
+                    # Estimate transaction size: inputs * 180 + outputs * 34 + 10
+                    estimated_inputs = min(3, len(all_utxos))  # Assume max 3 inputs needed
+                    estimated_outputs = 2  # recipient + change
+                    estimated_size = estimated_inputs * 180 + estimated_outputs * 34 + 10
+                    estimated_fee = (network_fee * estimated_size) / 1000  # fee per byte
+                    
+                    return max(estimated_fee, Decimal('0.0001')), False
+                except:
+                    return Decimal('0.01'), False  # Fallback
+                    
+        except Exception as e:
+            self.logger.error(f"Fee estimation failed: {e}")
+            return Decimal('0.01'), False
+    
+    def consolidate_utxos(self, user: User, target_address: str = None, 
+                         max_fee: Decimal = Decimal('0.01')) -> Tuple[bool, str]:
+        """
+        Consolidate small UTXOs into larger ones to improve future transaction efficiency.
+        
+        Args:
+            user: User whose UTXOs to consolidate
+            target_address: Address to consolidate to (uses user's primary if None)
+            max_fee: Maximum fee to pay for consolidation
+            
+        Returns:
+            (success, message_or_txid)
+        """
+        try:
+            addresses = self.rpc.get_addresses_by_account(user.trmp_account)
+            if not addresses:
+                return False, "No addresses found for user"
+            
+            if target_address is None:
+                target_address = user.trmp_address
+            
+            # Get all UTXOs
+            all_utxos = []
+            for addr in addresses:
+                utxos = self.rpc.list_unspent(self.confirmation_blocks, 9999999, [addr])
+                all_utxos.extend(utxos)
+            
+            if len(all_utxos) < 2:
+                return False, "Not enough UTXOs to consolidate"
+            
+            # Sort by amount and consolidate smaller ones
+            all_utxos.sort(key=lambda x: Decimal(str(x['amount'])))
+            
+            # Take up to 10 smallest UTXOs for consolidation
+            utxos_to_consolidate = all_utxos[:min(10, len(all_utxos))]
+            total_input = sum(Decimal(str(utxo['amount'])) for utxo in utxos_to_consolidate)
+            
+            if total_input <= max_fee:
+                return False, f"Total UTXO value ({total_input}) is too small to consolidate"
+            
+            # Build consolidation transaction
+            inputs = []
+            for utxo in utxos_to_consolidate:
+                inputs.append({
+                    "txid": utxo['txid'],
+                    "vout": utxo['vout']
+                })
+            
+            # Single output (consolidation target)
+            output_amount = total_input - max_fee
+            outputs = {target_address: float(output_amount)}
+            
+            # Create and send transaction
+            raw_tx = self.rpc.create_raw_transaction(inputs, outputs)
+            signed_result = self.rpc.sign_raw_transaction(raw_tx)
+            
+            if not signed_result.get('complete', False):
+                return False, "Failed to sign consolidation transaction"
+            
+            txid = self.rpc.send_raw_transaction(signed_result['hex'])
+            
+            self.logger.info(f"UTXO consolidation successful for {user.username}: {len(utxos_to_consolidate)} UTXOs -> 1 UTXO, txid: {txid}")
+            return True, f"Consolidated {len(utxos_to_consolidate)} UTXOs into one. Transaction: {txid}"
+            
+        except Exception as e:
+            self.logger.error(f"UTXO consolidation failed for {user.username}: {e}")
+            return False, f"Consolidation failed: {str(e)}"

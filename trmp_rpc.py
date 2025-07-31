@@ -217,3 +217,111 @@ class TrumpowRPC:
             self.set_account(address, account)
         
         return address
+    
+    # Raw Transaction Methods
+    def list_unspent(self, minconf: int = 1, maxconf: int = 9999999, 
+                     addresses: List[str] = None) -> List[Dict]:
+        """List unspent transaction outputs."""
+        params = [minconf, maxconf]
+        if addresses:
+            params.append(addresses)
+        return self._call_rpc("listunspent", params)
+    
+    def create_raw_transaction(self, inputs: List[Dict], outputs: Dict) -> str:
+        """Create a raw transaction."""
+        return self._call_rpc("createrawtransaction", [inputs, outputs])
+    
+    def sign_raw_transaction(self, hex_string: str, prev_txs: List[Dict] = None, 
+                           private_keys: List[str] = None, sighash_type: str = "ALL") -> Dict:
+        """Sign a raw transaction."""
+        params = [hex_string]
+        if prev_txs is not None:
+            params.append(prev_txs)
+        if private_keys is not None:
+            params.append(private_keys)
+        if sighash_type != "ALL":
+            params.append(sighash_type)
+        return self._call_rpc("signrawtransaction", params)
+    
+    def decode_raw_transaction(self, hex_string: str) -> Dict:
+        """Decode a raw transaction."""
+        return self._call_rpc("decoderawtransaction", [hex_string])
+    
+    def fund_raw_transaction(self, hex_string: str, options: Dict = None) -> Dict:
+        """Fund a raw transaction."""
+        params = [hex_string]
+        if options:
+            params.append(options)
+        return self._call_rpc("fundrawtransaction", params)
+    
+    # Block and Network Methods
+    def get_best_block_hash(self) -> str:
+        """Get the hash of the best (tip) block."""
+        return self._call_rpc("getbestblockhash")
+    
+    def get_block(self, block_hash: str, verbosity: int = 1) -> Dict:
+        """Get block information."""
+        return self._call_rpc("getblock", [block_hash, verbosity])
+    
+    def get_block_hash(self, height: int) -> str:
+        """Get block hash at specified height."""
+        return self._call_rpc("getblockhash", [height])
+    
+    def get_mempool_info(self) -> Dict:
+        """Get mempool information."""
+        return self._call_rpc("getmempoolinfo")
+    
+    def get_raw_mempool(self, verbose: bool = False) -> List:
+        """Get raw mempool contents."""
+        return self._call_rpc("getrawmempool", [verbose])
+    
+    # Address and Key Management
+    def dump_private_key(self, address: str) -> str:
+        """Get private key for an address."""
+        return self._call_rpc("dumpprivkey", [address])
+    
+    def import_private_key(self, private_key: str, label: str = "", rescan: bool = True) -> None:
+        """Import a private key."""
+        self._call_rpc("importprivkey", [private_key, label, rescan])
+    
+    def import_address(self, address: str, label: str = "", rescan: bool = True, 
+                      p2sh: bool = False) -> None:
+        """Import an address for watching."""
+        self._call_rpc("importaddress", [address, label, rescan, p2sh])
+    
+    # Advanced Transaction Methods
+    def lock_unspent(self, unlock: bool, transactions: List[Dict] = None) -> bool:
+        """Lock or unlock unspent outputs."""
+        params = [unlock]
+        if transactions:
+            params.append(transactions)
+        return self._call_rpc("lockunspent", params)
+    
+    def list_lock_unspent(self) -> List[Dict]:
+        """List locked unspent outputs."""
+        return self._call_rpc("listlockunspent")
+    
+    def send_many(self, from_account: str, amounts: Dict[str, Decimal], 
+                  minconf: int = 1, comment: str = "", subtract_fee_from_amount: List[str] = None) -> str:
+        """Send to multiple addresses."""
+        # Convert Decimal amounts to strings
+        amounts_str = {addr: f"{amount:.8f}" for addr, amount in amounts.items()}
+        params = [from_account, amounts_str, minconf, comment]
+        if subtract_fee_from_amount:
+            params.append(subtract_fee_from_amount)
+        return self._call_rpc("sendmany", params)
+    
+    def get_tx_out(self, txid: str, vout: int, include_mempool: bool = True) -> Dict:
+        """Get details about an unspent transaction output."""
+        return self._call_rpc("gettxout", [txid, vout, include_mempool])
+    
+    def get_tx_out_proof(self, txids: List[str], block_hash: str = None) -> str:
+        """Get proof that transactions are in a block."""
+        params = [txids]
+        if block_hash:
+            params.append(block_hash)
+        return self._call_rpc("gettxoutproof", params)
+    
+    def verify_tx_out_proof(self, proof: str) -> List[str]:
+        """Verify a transaction proof."""
+        return self._call_rpc("verifytxoutproof", [proof])
