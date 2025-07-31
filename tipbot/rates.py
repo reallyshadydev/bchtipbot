@@ -1,194 +1,197 @@
 import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+# CoinGecko API for Dogecoin prices
+COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price"
+
+# Supported currencies
+SUPPORTED_CURRENCIES = [
+    "usd", "eur", "gbp", "jpy", "cad", "aud", "cny", "chf", "sek", "nzd", 
+    "krw", "btc", "eth", "ltc", "bch", "bnb", "ada", "dot", "link", "xlm"
+]
 
 
-RATE_API = "https://bitpay.com/rates/BCH/"
-CURRENCY_CODE = {
-    "BTC": 0,
-    "BCH": 1,
-    "USD": 2,
-    "EUR": 3,
-    "GBP": 4,
-    "JPY": 5,
-    "CAD": 6,
-    "AUD": 7,
-    "CNY": 8,
-    "CHF": 9,
-    "SEK": 10,
-    "NZD": 11,
-    "KRW": 12,
-    "ETH": 13,
-    "XRP": 14,
-    "AED": 15,
-    "AFN": 16,
-    "ALL": 17,
-    "AMD": 18,
-    "ANG": 19,
-    "AOA": 20,
-    "ARS": 21,
-    "AWG": 22,
-    "AZN": 23,
-    "BAM": 24,
-    "BBD": 25,
-    "BDT": 26,
-    "BGN": 27,
-    "BHD": 28,
-    "BIF": 29,
-    "BMD": 30,
-    "BND": 31,
-    "BOB": 32,
-    "BRL": 33,
-    "BSD": 34,
-    "BTN": 35,
-    "BUSD": 36,
-    "BWP": 37,
-    "BYN": 38,
-    "BZD": 39,
-    "CDF": 40,
-    "CLF": 41,
-    "CLP": 42,
-    "COP": 43,
-    "CRC": 44,
-    "CUP": 45,
-    "CVE": 46,
-    "CZK": 47,
-    "DJF": 48,
-    "DKK": 49,
-    "DOP": 50,
-    "DZD": 51,
-    "EGP": 52,
-    "ETB": 53,
-    "FJD": 54,
-    "FKP": 55,
-    "GEL": 56,
-    "GHS": 57,
-    "GIP": 58,
-    "GMD": 59,
-    "GNF": 60,
-    "GTQ": 61,
-    "GUSD": 62,
-    "GYD": 63,
-    "HKD": 64,
-    "HNL": 65,
-    "HRK": 66,
-    "HTG": 67,
-    "HUF": 68,
-    "IDR": 69,
-    "ILS": 70,
-    "INR": 71,
-    "IQD": 72,
-    "IRR": 73,
-    "ISK": 74,
-    "JEP": 75,
-    "JMD": 76,
-    "JOD": 77,
-    "KES": 78,
-    "KGS": 79,
-    "KHR": 80,
-    "KMF": 81,
-    "KPW": 82,
-    "KWD": 83,
-    "KYD": 84,
-    "KZT": 85,
-    "LAK": 86,
-    "LBP": 87,
-    "LKR": 88,
-    "LRD": 89,
-    "LSL": 90,
-    "LYD": 91,
-    "MAD": 92,
-    "MDL": 93,
-    "MGA": 94,
-    "MKD": 95,
-    "MMK": 96,
-    "MNT": 97,
-    "MOP": 98,
-    "MRU": 99,
-    "MUR": 100,
-    "MVR": 101,
-    "MWK": 102,
-    "MXN": 103,
-    "MYR": 104,
-    "MZN": 105,
-    "NAD": 106,
-    "NGN": 107,
-    "NIO": 108,
-    "NOK": 109,
-    "NPR": 110,
-    "OMR": 111,
-    "PAB": 112,
-    "PAX": 113,
-    "PEN": 114,
-    "PGK": 115,
-    "PHP": 116,
-    "PKR": 117,
-    "PLN": 118,
-    "PYG": 119,
-    "QAR": 120,
-    "RON": 121,
-    "RSD": 122,
-    "RUB": 123,
-    "RWF": 124,
-    "SAR": 125,
-    "SBD": 126,
-    "SCR": 127,
-    "SDG": 128,
-    "SGD": 129,
-    "SHP": 130,
-    "SLL": 131,
-    "SOS": 132,
-    "SRD": 133,
-    "STN": 134,
-    "SVC": 135,
-    "SYP": 136,
-    "SZL": 137,
-    "THB": 138,
-    "TJS": 139,
-    "TMT": 140,
-    "TND": 141,
-    "TOP": 142,
-    "TRY": 143,
-    "TTD": 144,
-    "TWD": 145,
-    "TZS": 146,
-    "UAH": 147,
-    "UGX": 148,
-    "USDC": 149,
-    "UYU": 150,
-    "UZS": 151,
-    "VEF": 152,
-    "VES": 153,
-    "VND": 154,
-    "VUV": 155,
-    "WST": 156,
-    "XAF": 157,
-    "XAG": 158,
-    "XAU": 159,
-    "XCD": 160,
-    "XPF": 161,
-    "XOF": 162,
-    "YER": 163,
-    "ZAR": 164,
-    "ZMW": 165,
-    "ZWL": 166,
-}
-
-
-def get_rate(update, currency="USD"):
-    """Returns the BCH price fetching BitPay API
-
-    API documentation:
-    https://bitpay.com/api/#rest-api-resources-rates-fetch-the-rates-used-by-bitpay-for-a-specific-cryptocurrency
+def get_rate(currency="usd"):
     """
+    Get the current Dogecoin price in the specified currency.
+    
+    Args:
+        currency (str): The currency code (default: "usd")
+        
+    Returns:
+        float: The current price of Dogecoin in the specified currency
+        None: If the request fails or currency is not supported
+    """
+    currency = currency.lower()
+    
+    if currency not in SUPPORTED_CURRENCIES:
+        logger.warning(f"Currency {currency} not supported. Using USD instead.")
+        currency = "usd"
+    
+    try:
+        params = {
+            "ids": "dogecoin",
+            "vs_currencies": currency
+        }
+        
+        response = requests.get(COINGECKO_API, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        price = data.get("dogecoin", {}).get(currency)
+        
+        if price is None:
+            logger.error(f"Price not found for currency: {currency}")
+            return None
+            
+        return float(price)
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching Dogecoin price: {e}")
+        return None
+    except (KeyError, ValueError, TypeError) as e:
+        logger.error(f"Error parsing price data: {e}")
+        return None
+
+
+def get_multiple_rates(currencies=None):
+    """
+    Get Dogecoin prices in multiple currencies.
+    
+    Args:
+        currencies (list): List of currency codes. If None, gets major currencies.
+        
+    Returns:
+        dict: Dictionary with currency codes as keys and prices as values
+    """
+    if currencies is None:
+        currencies = ["usd", "eur", "gbp", "btc", "eth"]
+    
+    # Filter out unsupported currencies
+    currencies = [c.lower() for c in currencies if c.lower() in SUPPORTED_CURRENCIES]
+    
+    if not currencies:
+        logger.warning("No supported currencies provided. Using USD.")
+        currencies = ["usd"]
+    
+    try:
+        params = {
+            "ids": "dogecoin",
+            "vs_currencies": ",".join(currencies)
+        }
+        
+        response = requests.get(COINGECKO_API, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        prices = data.get("dogecoin", {})
+        
+        # Convert to float values
+        result = {}
+        for currency in currencies:
+            price = prices.get(currency)
+            if price is not None:
+                result[currency.upper()] = float(price)
+        
+        return result
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching Dogecoin prices: {e}")
+        return {}
+    except (KeyError, ValueError, TypeError) as e:
+        logger.error(f"Error parsing price data: {e}")
+        return {}
+
+
+def format_price(price, currency="USD"):
+    """
+    Format price for display.
+    
+    Args:
+        price (float): The price value
+        currency (str): The currency code
+        
+    Returns:
+        str: Formatted price string
+    """
+    if price is None:
+        return "Price unavailable"
+    
     currency = currency.upper()
+    
+    # Special formatting for different currency types
+    if currency in ["BTC", "ETH", "LTC", "BCH"]:
+        # Crypto currencies - show more decimal places
+        return f"{price:.8f} {currency}"
+    elif currency in ["JPY", "KRW"]:
+        # Currencies that don't use decimal places
+        return f"{price:.0f} {currency}"
+    else:
+        # Fiat currencies - show 2-4 decimal places depending on value
+        if price < 0.01:
+            return f"{price:.6f} {currency}"
+        elif price < 1:
+            return f"{price:.4f} {currency}"
+        else:
+            return f"{price:.2f} {currency}"
 
-    if currency not in CURRENCY_CODE:
-        return update.message.reply_text(f"{currency} is not a supported " "currency.")
 
-    r = requests.get(RATE_API)
-    if r.status_code != 200:  # pragma: no cover
-        return update.message.reply_text(f"Unable to contact {RATE_API}")
+def convert_doge_to_currency(doge_amount, currency="usd"):
+    """
+    Convert Dogecoin amount to specified currency.
+    
+    Args:
+        doge_amount (float): Amount of Dogecoin
+        currency (str): Target currency
+        
+    Returns:
+        float: Converted amount, or None if conversion fails
+    """
+    rate = get_rate(currency)
+    if rate is None:
+        return None
+    
+    return float(doge_amount) * rate
 
-    data = r.json()["data"]
-    rate = data[CURRENCY_CODE[currency]]["rate"]
 
-    return rate
+def convert_currency_to_doge(amount, currency="usd"):
+    """
+    Convert currency amount to Dogecoin.
+    
+    Args:
+        amount (float): Amount in the specified currency
+        currency (str): Source currency
+        
+    Returns:
+        float: Amount in Dogecoin, or None if conversion fails
+    """
+    rate = get_rate(currency)
+    if rate is None or rate == 0:
+        return None
+    
+    return float(amount) / rate
+
+
+def is_currency_supported(currency):
+    """
+    Check if a currency is supported.
+    
+    Args:
+        currency (str): Currency code to check
+        
+    Returns:
+        bool: True if supported, False otherwise
+    """
+    return currency.lower() in SUPPORTED_CURRENCIES
+
+
+def get_supported_currencies():
+    """
+    Get list of supported currencies.
+    
+    Returns:
+        list: List of supported currency codes
+    """
+    return SUPPORTED_CURRENCIES.copy()

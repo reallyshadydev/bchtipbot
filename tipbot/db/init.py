@@ -1,6 +1,6 @@
-from bitcash import Key
 from peewee import IntegrityError
 from .models import db, User
+from ..dogecoin_client import get_dogecoin_client
 
 
 def create_user(username):
@@ -8,9 +8,11 @@ def create_user(username):
     Returns True if a user is created, False otherwise.
     """
     db.connect(reuse_if_open=True)
-    key = Key()
+    client = get_dogecoin_client()
     try:
-        User.create(username=username, bch_address=key.address, wif=key.to_wif())
+        # Generate a new Dogecoin address for the user
+        doge_address = client.get_new_address(f"user_{username}")
+        User.create(username=username, doge_address=doge_address)
         db.close()
         return True
     except IntegrityError:

@@ -1,5 +1,6 @@
 from peewee import *
 import os
+import datetime
 from urllib.parse import urlparse, uses_netloc
 from settings import DEBUG
 
@@ -20,8 +21,8 @@ else:
 
 class User(Model):
     username = CharField(max_length=30, unique=True)
-    bch_address = CharField(max_length=54, unique=True)
-    wif = CharField(max_length=54, unique=True)
+    doge_address = CharField(max_length=54, unique=True)
+    created_at = DateTimeField(default=datetime.datetime.now)
 
     class Meta:
         database = db

@@ -1,4 +1,8 @@
 # Functions checking for incorrect inputs
+from dogecoin_client import get_dogecoin_client
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def check_username(update):
@@ -16,10 +20,13 @@ def check_username(update):
 
 
 def amount_is_valid(amount):
-    """Checks if [amount] is a valid BCH amount"""
+    """Checks if [amount] is a valid Dogecoin amount"""
     try:
         amount = float(amount)
         if amount <= 0:
+            return False
+        # Check if amount is reasonable (not too many decimal places)
+        if len(str(amount).split('.')[-1]) > 8:
             return False
     except Exception:
         return False
@@ -40,15 +47,20 @@ def username_is_valid(username):
 
 def check_address(update, address):
     """
-    Checks if a BCH address is correct
-    It also prepends 'bitcoincash:' prefix if missing
+    Checks if a Dogecoin address is correct using Dogecoin Core RPC
 
-    Returns the BCH address if correct, False otherwise
+    Returns the address if correct, False otherwise
     """
-    if len(address) != 54 and len(address) != 42:
-        message = f"{address} is not a valid Bitcoin Cash address."
+    try:
+        client = get_dogecoin_client()
+        if client.validate_address(address):
+            return address
+        else:
+            message = f"{address} is not a valid Dogecoin address."
+            update.message.reply_text(message)
+            return False
+    except Exception as e:
+        logger.error(f"Error validating address {address}: {e}")
+        message = f"Unable to validate address {address}. Please check and try again."
         update.message.reply_text(message)
         return False
-    if "bitcoincash:" not in address:
-        address = "bitcoincash:" + address
-    return address

@@ -1,0 +1,43 @@
+# Dogecoin Core Configuration Example
+# Copy this file to your Dogecoin data directory as 'dogecoin.conf'
+
+# Enable RPC server
+server=1
+
+# RPC credentials (change these to secure values)
+rpcuser=your_rpc_username
+rpcpassword=your_secure_rpc_password
+
+# RPC network settings
+rpcallowip=127.0.0.1
+rpcport=22555
+
+# Optional: Bind to specific interface (default is 127.0.0.1)
+# rpcbind=127.0.0.1
+
+# Optional: Enable wallet functionality
+# If you're using a newer version of Dogecoin Core, you might need to explicitly load a wallet
+# wallet=wallet.dat
+
+# Optional: Set transaction fee (in DOGE per kB)
+# paytxfee=0.01
+
+# Optional: Enable transaction indexing (required for some RPC calls)
+# txindex=1
+
+# Optional: Reduce memory usage
+# dbcache=100
+
+# Optional: Limit connections
+# maxconnections=40
+
+# Optional: Enable logging
+# debug=1
+
+# Security: Disable deprecated features
+# deprecatedrpc=accounts
+
+# Network settings (uncomment for testnet)
+# testnet=1
+# [test]
+# rpcport=44555

@@ -1,14 +1,18 @@
 from time import sleep
+from decimal import Decimal
+import logging
 
-from bitcash import Key
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from db.get import get_address, get_wif
+from db.get import get_address
 from db.init import create_user
+from dogecoin_client import get_dogecoin_client
 import checks
 from settings import FEE_ADDRESS, FEE_PERCENTAGE
-from rates import get_rate
+from rates import get_rate, format_price, convert_doge_to_currency, convert_currency_to_doge, is_currency_supported
+
+logger = logging.getLogger(__name__)
 
 
 def start(update: Update, _: CallbackContext):
@@ -29,7 +33,7 @@ def start(update: Update, _: CallbackContext):
 
 def deposit(update: Update, _: CallbackContext):
     """
-    Fetches and returns the Bitcoin Cash address saved in the db if the command
+    Fetches and returns the Dogecoin address saved in the db if the command
     was sent in a direct message. Asks to send DM otherwise.
     """
     if not checks.check_username(update):
@@ -41,16 +45,14 @@ def deposit(update: Update, _: CallbackContext):
 
     create_user(update.message.from_user.username)  # check if user is created
     address = get_address(update.message.from_user.username)
-    update.message.reply_text("Send Bitcoin Cash to:")
-    return update.message.reply_html("<b>{}</b>".format(address))
+    update.message.reply_text("Send Dogecoin to:")
+    return update.message.reply_html(f"<b>{address}</b>")
 
 
 def balance(update, context: CallbackContext):
-    """Fetches and returns the balance (in USD)"""
+    """Fetches and returns the balance"""
     currency = context.args[0].lower() if context.args else "usd"
-    if currency == "satoshis":  # in case user uses plural
-        currency = "satoshi"
-
+    
     if not checks.check_username(update):
         return
     if update.message.chat.type != "private":  # check if in DM
@@ -59,24 +61,34 @@ def balance(update, context: CallbackContext):
         )
 
     create_user(update.message.from_user.username)
-    key = Key(get_wif(update.message.from_user.username))
+    address = get_address(update.message.from_user.username)
+    
     try:
-        balance = key.get_balance(currency)
-    except KeyError:
-        return update.message.reply_text(currency + " is not a supported currency")
-
-    # display the message
-    if currency == "usd":  # better display for USD (default)
-        currency = "$"
-    message = f"You have: {currency.upper()}" + str(balance)
-    if currency == "satoshi":  # better display for satoshis
-        message = "You have: " + str(balance) + " satoshis"
-
-    return update.message.reply_text(message)
+        client = get_dogecoin_client()
+        doge_balance = client.get_balance(address)
+        
+        if currency == "doge" or currency == "dogecoin":
+            message = f"You have: {doge_balance:.8f} DOGE"
+        else:
+            if not is_currency_supported(currency):
+                return update.message.reply_text(f"{currency} is not a supported currency")
+            
+            converted_balance = convert_doge_to_currency(doge_balance, currency)
+            if converted_balance is None:
+                return update.message.reply_text("Unable to fetch current exchange rate")
+            
+            formatted_balance = format_price(converted_balance, currency)
+            message = f"You have: {formatted_balance} ({doge_balance:.8f} DOGE)"
+        
+        return update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error getting balance: {e}")
+        return update.message.reply_text("Unable to fetch balance. Please try again later.")
 
 
 def withdraw(update, context: CallbackContext):
-    """Withdraws BCH to user's wallet"""
+    """Withdraws DOGE to user's wallet"""
     if not checks.check_username(update):
         return
 
@@ -97,76 +109,75 @@ def withdraw(update, context: CallbackContext):
     if not address:  # does not send anything if address is False
         return
 
-    wif = get_wif(update.message.from_user.username)
-    key = Key(wif)
-
-    sent_amount = 0
-    currency = "usd"
-    if context.args[0] != "all":
-        amount = context.args[0].replace("$", "")
-        if not checks.amount_is_valid(amount):
-            return update.message.reply_text(amount + " is not a valid amount")
-        sent_amount = float(amount) - 0.01  # after 1 cent fee
-
-    outputs = [
-        (address, sent_amount, currency),
-    ]
-    key.get_unspents()
-    sleep(2)
+    username = update.message.from_user.username
+    user_address = get_address(username)
+    
     try:
+        client = get_dogecoin_client()
+        current_balance = client.get_balance(user_address)
+        
+        if current_balance <= 0:
+            return update.message.reply_text("You don't have any funds to withdraw!")
+        
         if context.args[0] == "all":
-            tx_id = key.send([], leftover=address)
+            # Withdraw all funds minus a small fee for the transaction
+            amount = current_balance - Decimal('0.01')  # Leave 0.01 DOGE for tx fee
+            if amount <= 0:
+                return update.message.reply_text("Insufficient balance to cover transaction fee!")
         else:
-            tx_id = key.send(outputs)
+            amount_str = context.args[0].replace("$", "")
+            if not checks.amount_is_valid(amount_str):
+                return update.message.reply_text(f"{amount_str} is not a valid amount")
+            
+            amount = Decimal(amount_str)
+            if amount > current_balance:
+                return update.message.reply_text("You don't have enough funds!")
+        
+        # Send the transaction
+        tx_id = client.send_to_address(address, amount, f"Withdrawal for {username}")
+        
+        return update.message.reply_text(f"Sent! Transaction ID: {tx_id}")
+        
     except Exception as e:
-        print("⚠️ ERROR:", e)
-        return update.message.reply_text(
-            f"Transaction failed due to the following error: {e}"
-        )
-
-    return update.message.reply_text("Sent! Transaction ID: " + tx_id)
+        logger.error(f"Withdrawal error: {e}")
+        return update.message.reply_text(f"Transaction failed: {str(e)}")
 
 
 def help_command(update: Update, _: CallbackContext):
     """Displays the help text"""
     return update.message.reply_text(
         """/start - Starts the bot
-/deposit - Displays your Bitcoin Cash address for top up
-/balance - Shows your balance in Bitcoin Cash
+/deposit - Displays your Dogecoin address for top up
+/balance - Shows your balance in Dogecoin
 /withdraw - Withdraw your funds. Usage: /withdraw [amount] [address]
 /help - Lists all commands
 /tip - Sends a tip. Usage: /tip [amount] [@username]
-/price - Displays the current price of Bitcoin Cash"""
+/price - Displays the current price of Dogecoin"""
     )
 
 
-def tip(update, context: CallbackContext, satoshi=False):
-    """Sends Bitcoin Cash on-chain"""
+def tip(update, context: CallbackContext):
+    """Sends Dogecoin tip"""
     if not checks.check_username(update):
         return
 
     args = context.args
-
-    try:  # in case the user wants to tip satoshis
-        if args[1] == "satoshi" or args[1] == "satoshis":
-            satoshi = True
-            args[1] = args[2]
-    except IndexError:
-        pass
 
     if len(args) < 2 and not update.message.reply_to_message:
         return update.message.reply_text("Usage: /tip [amount] [username]")
 
     if "@" in args[0]:
         # this swaps args[0] and args[1] in case user input username before
-        # amount (e.g. /tip @merc1er $1) - the latter will still work
+        # amount (e.g. /tip @username 10) - the latter will still work
         tmp = args[1]
         args[1] = args[0]
         args[0] = tmp
 
-    amount = args[0].replace("$", "")
-    if not checks.amount_is_valid(amount):
-        return update.message.reply_text(amount + " is not a valid amount.")
+    amount_str = args[0].replace("$", "")
+    if not checks.amount_is_valid(amount_str):
+        return update.message.reply_text(f"{amount_str} is not a valid amount.")
+
+    amount = Decimal(amount_str)
 
     if update.message.reply_to_message:
         recipient_username = update.message.reply_to_message.from_user.username
@@ -178,7 +189,7 @@ def tip(update, context: CallbackContext, satoshi=False):
         recipient_username = args[1]
         if not checks.username_is_valid(recipient_username):
             return update.message.reply_text(
-                recipient_username + " is not a valid username."
+                f"{recipient_username} is not a valid username."
             )
 
     recipient_username = recipient_username.replace("@", "")
@@ -187,56 +198,68 @@ def tip(update, context: CallbackContext, satoshi=False):
     if recipient_username == sender_username:
         return update.message.reply_text("You cannot send money to yourself.")
 
-    create_user(recipient_username)  # IMPROVE
+    # Create recipient user if they don't exist
+    create_user(recipient_username)
     recipient_address = get_address(recipient_username)
-    sender_wif = get_wif(sender_username)
-
-    key = Key(sender_wif)
-    balance = key.get_balance("usd")
-    sleep(2)
-    # checks the balance
-    if float(amount) > float(balance) and not satoshi:
-        return update.message.reply_text(
-            "You don't have enough funds! " + "Type /deposit to add funds!!"
-        )
-
-    fee = float(amount) * FEE_PERCENTAGE
-    sent_amount = float(amount)
-
-    if satoshi:  # if user is sending satoshis
-        outputs = [(recipient_address, sent_amount, "satoshi")]
-    elif fee < 0.01:  # if the bot fee is less than 1 cent, don't take any fee
-        outputs = [(recipient_address, sent_amount, "usd")]
-    else:
-        sent_amount -= fee  # deducts fee
-        outputs = [
-            (recipient_address, sent_amount, "usd"),
-            (FEE_ADDRESS, fee, "usd"),
-        ]
+    sender_address = get_address(sender_username)
 
     try:
-        key.send(outputs)
-    except Exception as e:
-        print("⚠️ ERROR:", e)
-        return update.message.reply_text(
-            f"Transaction failed due to the following error: {e}"
-        )
+        client = get_dogecoin_client()
+        sender_balance = client.get_balance(sender_address)
+        
+        # Check if sender has enough balance
+        if amount > sender_balance:
+            return update.message.reply_text(
+                "You don't have enough funds! Type /deposit to add funds!"
+            )
 
-    if satoshi:
-        message = "You sent " + amount + " satoshis to " + recipient_username
-    else:
-        message = "You sent $" + amount + " to " + recipient_username
-    return update.message.reply_html(text=message)
+        # Calculate fee (only for tips over 1 DOGE)
+        fee = Decimal('0')
+        if amount >= Decimal('1'):
+            fee = amount * Decimal(str(FEE_PERCENTAGE))
+            if fee < Decimal('0.01'):  # Minimum fee
+                fee = Decimal('0')
+
+        total_amount = amount + fee
+        if total_amount > sender_balance:
+            return update.message.reply_text(
+                "You don't have enough funds to cover the tip and fee!"
+            )
+
+        # Create transaction outputs
+        outputs = []
+        
+        # Send tip to recipient
+        tx_id_tip = client.send_to_address(recipient_address, amount, f"Tip from {sender_username}")
+        
+        # Send fee if applicable
+        if fee > 0:
+            tx_id_fee = client.send_to_address(FEE_ADDRESS, fee, f"Fee from tip by {sender_username}")
+        
+        message = f"You sent {amount:.8f} DOGE to @{recipient_username}"
+        if fee > 0:
+            message += f" (fee: {fee:.8f} DOGE)"
+            
+        return update.message.reply_html(text=message)
+        
+    except Exception as e:
+        logger.error(f"Tip error: {e}")
+        return update.message.reply_text(f"Transaction failed: {str(e)}")
 
 
 def price(update, context: CallbackContext):
-    """Fetches and returns the price of BCH"""
-    currency = context.args[0].upper() if context.args else "USD"
+    """Fetches and returns the price of DOGE"""
+    currency = context.args[0].lower() if context.args else "usd"
+    
+    if not is_currency_supported(currency):
+        supported = ", ".join(["usd", "eur", "gbp", "btc", "eth"])
+        return update.message.reply_text(
+            f"{currency} is not supported. Supported currencies: {supported}"
+        )
 
-    # fetches rate and rounds to appropriate decimal
-    if currency == "BTC":
-        bch_price = round(get_rate(update, currency), 4)
-    else:
-        bch_price = round(get_rate(update, currency), 2)
-
-    return update.message.reply_text(text="1 BCH = " + str(bch_price) + " " + currency)
+    doge_price = get_rate(currency)
+    if doge_price is None:
+        return update.message.reply_text("Unable to fetch current price. Please try again later.")
+    
+    formatted_price = format_price(doge_price, currency)
+    return update.message.reply_text(f"1 DOGE = {formatted_price}")
