@@ -1,0 +1,33 @@
+[Unit]
+Description=Trumpow Telegram Tip Bot
+After=network.target trumpowd.service
+Wants=trumpowd.service
+
+[Service]
+Type=simple
+User=trumpow
+Group=trumpow
+WorkingDirectory=/opt/trumpow-tip-bot
+ExecStart=/usr/bin/python3 /opt/trumpow-tip-bot/tip_bot.py
+Restart=always
+RestartSec=10
+
+# Environment variables (optional - can also use .env file)
+# Environment=TELEGRAM_BOT_TOKEN=your_token_here
+# Environment=TRMP_RPC_USER=your_rpc_user
+# Environment=TRMP_RPC_PASSWORD=your_rpc_password
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trumpow-tip-bot
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trumpow-tipbot
+
+[Install]
+WantedBy=multi-user.target
