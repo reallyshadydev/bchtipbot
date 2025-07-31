@@ -1,18 +1,45 @@
-from bitcash import Key
-from peewee import IntegrityError
-from .models import db, User
+import logging
+from db.models import User, db
+from trmp_wallet import wallet
+
+logger = logging.getLogger(__name__)
 
 
-def create_user(username):
-    """Checks if a Telegram user is present in the database.
-    Returns True if a user is created, False otherwise.
+def create_user(username: str) -> bool:
     """
-    db.connect(reuse_if_open=True)
-    key = Key()
+    Create a new user with a TRMP address
+    Returns True if user was created, False if user already exists
+    """
     try:
-        User.create(username=username, bch_address=key.address, wif=key.to_wif())
-        db.close()
+        # Check if user already exists
+        existing_user = User.select().where(User.username == username).first()
+        if existing_user:
+            logger.info(f"User {username} already exists")
+            return False
+        
+        # Create new TRMP address for the user
+        trmp_address = wallet.get_new_address_for_user(username)
+        
+        # Create user in database
+        User.create(
+            username=username,
+            trmp_address=trmp_address
+        )
+        
+        logger.info(f"Created new user: {username} with address: {trmp_address}")
         return True
-    except IntegrityError:
-        db.close()
+        
+    except Exception as e:
+        logger.error(f"Failed to create user {username}: {e}")
         return False
+
+
+def init_database():
+    """Initialize database tables"""
+    try:
+        db.connect()
+        db.create_tables([User], safe=True)
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise

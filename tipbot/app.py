@@ -1,51 +1,90 @@
-from telegram.ext import Updater, CommandHandler
-from commands import *
-from admin.commands import stats
 import logging
 import os
-from settings import TOKEN, DEBUG
-from db.models import db, User
+from telegram.ext import Application, CommandHandler
+from commands import start, help_command, deposit, balance, withdraw, tip, price
+from admin.commands import stats, wallet_info, backup_users, broadcast, recent_transactions
+from settings import TELEGRAM_BOT_TOKEN, DEBUG, WEBHOOK_URL, WEBHOOK_PORT
+from db.init import init_database
+from db.models import User, Transaction
 
-
-if DEBUG:
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+logger = logging.getLogger(__name__)
 
 
 def main():
-    """Runs the bot"""
-    db.connect()
-    db.create_tables([User], safe=True)
-
-    updater = Updater(TOKEN)
-
-    # Commands
-    updater.dispatcher.add_handler(CommandHandler("start", start))
-    updater.dispatcher.add_handler(CommandHandler("help", help_command))
-    updater.dispatcher.add_handler(CommandHandler("deposit", deposit))
-    updater.dispatcher.add_handler(CommandHandler("balance", balance))
-    updater.dispatcher.add_handler(CommandHandler("withdraw", withdraw))
-    updater.dispatcher.add_handler(CommandHandler("tip", tip))
-    updater.dispatcher.add_handler(CommandHandler("price", price))
-    # admin commands
-    updater.dispatcher.add_handler(CommandHandler("stats", stats))
-
-    if DEBUG:
-        updater.start_polling()
-    else:
-        NAME = os.environ.get("NAME", "bchtipbot")
-        # Start the webhook
-        updater.start_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", "8443")),
-            url_path=TOKEN,
-            webhook_url="https://{}.herokuapp.com/{}".format(NAME, TOKEN),
-        )
-
-    updater.idle()
+    """Run the TRMP tip bot"""
+    try:
+        # Initialize database
+        logger.info("Initializing database...")
+        init_database()
+        
+        # Create tables
+        from db.models import db
+        db.create_tables([User, Transaction], safe=True)
+        logger.info("Database tables created/verified")
+        
+        # Create application
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Add command handlers
+        logger.info("Setting up command handlers...")
+        
+        # Basic commands
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        
+        # Wallet commands
+        application.add_handler(CommandHandler("deposit", deposit))
+        application.add_handler(CommandHandler("balance", balance))
+        application.add_handler(CommandHandler("withdraw", withdraw))
+        
+        # Tipping commands
+        application.add_handler(CommandHandler("tip", tip))
+        
+        # Price commands
+        application.add_handler(CommandHandler("price", price))
+        
+        # Admin commands
+        application.add_handler(CommandHandler("stats", stats))
+        application.add_handler(CommandHandler("wallet_info", wallet_info))
+        application.add_handler(CommandHandler("backup_users", backup_users))
+        application.add_handler(CommandHandler("broadcast", broadcast))
+        application.add_handler(CommandHandler("recent_transactions", recent_transactions))
+        
+        logger.info("Command handlers set up successfully")
+        
+        # Start the bot
+        if DEBUG:
+            logger.info("Starting bot in polling mode (DEBUG=True)")
+            application.run_polling(allowed_updates=["message"])
+        else:
+            if not WEBHOOK_URL:
+                logger.error("WEBHOOK_URL must be set for production mode")
+                return
+            
+            logger.info(f"Starting bot in webhook mode at {WEBHOOK_URL}")
+            
+            # Get the app name from environment or default
+            app_name = os.environ.get("HEROKU_APP_NAME", "trmp-tipbot")
+            
+            # Start webhook
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=WEBHOOK_PORT,
+                url_path=TELEGRAM_BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}",
+                allowed_updates=["message"]
+            )
+            
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        raise

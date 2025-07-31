@@ -1,5 +1,7 @@
-python-telegram-bot==13.11
-git+https://github.com/pybitcash/bitcash.git@0f8b342826d5ac5062fa6c2e30c20bb09d53f754
-peewee==3.14.4
-psycopg2
-requests==2.28.1
+python-telegram-bot==20.7
+python-bitcoinrpc==1.0
+peewee==3.17.0
+psycopg2-binary==2.9.9
+requests==2.31.0
+python-dotenv==1.0.0
+cryptography==41.0.8

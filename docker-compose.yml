@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  trmp-tipbot:
+    build: .
+    ports:
+      - "8443:8443"
+    environment:
+      - DEBUG=False
+      - DATABASE_URL=postgresql://trmpbot:password@db:5432/trmpbot
+    env_file:
+      - .env
+    depends_on:
+      - db
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: trmpbot
+      POSTGRES_USER: trmpbot
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  # Optional: Redis for future rate limiting
+  redis:
+    image: redis:6-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
